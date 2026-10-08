@@ -1,0 +1,46 @@
+import {DatabaseSync} from 'node:sqlite';
+import ts from 'typescript';
+import {readFileSync,readdirSync} from 'node:fs';
+import assert from 'node:assert/strict';
+const sql=new DatabaseSync(':memory:');sql.exec('PRAGMA foreign_keys=ON');
+for(const f of readdirSync('drizzle').filter(f=>f.endsWith('.sql')))sql.exec(readFileSync('drizzle/'+f,'utf8'));
+function prepare(text,args=[]){return {bind(...v){return prepare(text,v)},async first(){return sql.prepare(text).get(...args)||null},async all(){return {results:sql.prepare(text).all(...args)}},async run(){const r=sql.prepare(text).run(...args);return {meta:{changes:Number(r.changes)},results:[]}},text,args}}
+const DB={prepare,async batch(stmts){sql.exec('BEGIN');try{const out=stmts.map(v=>{const p=sql.prepare(v.text);if(/^SELECT/i.test(v.text))return {results:p.all(...v.args),meta:{changes:0}};const r=p.run(...v.args);return {results:[],meta:{changes:Number(r.changes)}}});sql.exec('COMMIT');return out}catch(e){sql.exec('ROLLBACK');throw e}}};
+globalThis.__schoolTestEnv={DB};
+const src=readFileSync('app/api/school/route.ts','utf8').replace("import {env} from 'cloudflare:workers';",'const env=globalThis.__schoolTestEnv;');
+const js=ts.transpileModule(src,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ESNext}}).outputText;
+const {GET,POST}=await import('data:text/javascript;base64,'+Buffer.from(js).toString('base64'));
+async function post(body,status=200){const r=await POST(new Request('http://test/api/school',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}));assert.equal(r.status,status,await r.clone().text());return r.json()}
+async function get(q=''){const r=await GET(new Request('http://test/api/school'+q));assert.equal(r.status,200,await r.clone().text());return r.json()}
+const originalError=console.error;console.error=()=>{};
+await post({action:'seed'});await post({action:'seed'},409);
+let d=await get();assert.equal(d.students.length,12);assert.equal(d.courses.length,4);assert.equal(d.enrollments.length,42);assert.equal(d.attendance.length,126);
+const student={action:'student',name:'Test Student',email:'test@example.com',phone:'09123456789',birthDate:'2004-01-01',program:'BS IT',year:1,guardian:'Test Guardian',address:'Demo address'};
+await post(student);await post(student,409);await post({...student,email:'bad',birthDate:'2030-01-01'},400);
+await post({...student,email:'second@example.com',name:'Second Student'});
+d=await get();const one=d.students.find(s=>s.email==='test@example.com'),two=d.students.find(s=>s.email==='second@example.com');
+const course={action:'course',code:'TEST101',title:'Test Course',instructor:'Test Instructor',term:'Test Term',credits:3,capacity:1,schedule:'Mon 9 AM'};
+await post(course);await post(course,409);
+d=await get();const c=d.courses.find(c=>c.code==='TEST101');
+await post({action:'enroll',studentId:one.id,courseId:c.id});
+await post({action:'enroll',studentId:two.id,courseId:c.id},409);
+await post({...course,id:c.id,title:'Changed'},409);
+d=await get();const e=d.enrollments.find(e=>e.course_id===c.id);assert.equal(d.courses.find(c=>c.id===e.course_id).enrolled,1);
+await post({action:'grade',id:e.id,score:90.25});await post({action:'grade',id:e.id,score:101},400);await post({action:'grade',id:e.id,score:-1},400);
+await post({action:'attendance',courseId:c.id,day:d.today,rows:[{enrollmentId:e.id,status:'Present'}]});
+await post({action:'attendance',courseId:c.id,day:d.today,rows:[{enrollmentId:e.id,status:'Late'}]});
+let p=await get('?studentId='+one.id);assert.equal(p.attendance.length,1);assert.equal(p.attendance[0].status,'Late');assert.equal(p.enrollments[0].score,90.25);
+const future=new Date(Date.parse(d.today)+86400000).toISOString().slice(0,10),yesterday=new Date(Date.parse(d.today)-86400000).toISOString().slice(0,10);
+await post({action:'attendance',courseId:c.id,day:future,rows:[{enrollmentId:e.id,status:'Present'}]},400);
+await post({action:'attendance',courseId:c.id,day:yesterday,rows:[{enrollmentId:e.id,status:'Present'}]},400);
+await post({action:'attendance',courseId:c.id,day:d.today,rows:[{enrollmentId:e.id,status:'Present'},{enrollmentId:e.id,status:'Absent'}]},400);
+await post({action:'studentStatus',id:one.id,status:'Inactive'});
+await post({action:'attendance',courseId:c.id,day:d.today,rows:[{enrollmentId:e.id,status:'Present'}]},400);
+await post({action:'withdraw',id:e.id});await post({action:'grade',id:e.id,score:80},409);
+p=await get('?studentId='+one.id);assert.equal(p.enrollments[0].status,'Withdrawn');assert.equal(p.enrollments[0].score,90.25);assert.equal(p.attendance.length,1);
+await post({action:'studentStatus',id:one.id,status:'Active'});await post({action:'enroll',studentId:one.id,courseId:c.id},409);
+await post({action:'courseStatus',id:c.id,status:'Closed'});await post({action:'enroll',studentId:two.id,courseId:c.id},409);
+await post({action:'courseStatus',id:c.id,status:'Open'});await post({action:'enroll',studentId:two.id,courseId:c.id});
+d=await get();const e2=d.enrollments.find(e=>e.student_id===two.id&&e.course_id===c.id);await post({action:'grade',id:e2.id,score:0});await post({action:'grade',id:e2.id,score:null});
+assert.equal((await get('?studentId='+two.id)).enrollments[0].score,null);
+console.error=originalError;console.log('PASS: seed, uniqueness, capacity, course locking, grades, attendance upsert/date/status, withdrawal history, duplicate enrollment, course closure and grade clearing.');
